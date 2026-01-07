@@ -1,0 +1,8 @@
+py-clob-client>=0.34.1
+eth-account>=0.13.0
+eth-utils>=4.1.1
+poly_eip712_structs>=0.0.1
+py-order-utils>=0.3.2
+python-dotenv
+py-builder-signing-sdk>=0.0.2
+httpx[http2]>=0.27.0

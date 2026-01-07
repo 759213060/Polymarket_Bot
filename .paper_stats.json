@@ -1,0 +1,14 @@
+{
+  "buy_count": 7,
+  "cash": 1.6577432199741713,
+  "created_at": 1767706286.6369839,
+  "fees_paid": 0.2101309867319061,
+  "initial_cash": 10.0,
+  "loss_count": 0,
+  "realized_pnl": 5.917865854908472,
+  "settle_count": 4,
+  "total_buy_notional": 21.013098673190605,
+  "total_payout": 17.167865854908474,
+  "updated_at": 1767713544.6149874,
+  "win_count": 4
+}
