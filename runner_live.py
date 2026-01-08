@@ -1,6 +1,7 @@
 import time
 from datetime import datetime, timezone
 import os
+import concurrent.futures
 
 from http_client import HttpClient
 from config import load_config
@@ -15,6 +16,14 @@ from order_manager import OrderManager
 from feishu_notifier import FeishuNotifier
 from paper_ledger import PaperLedger, PaperLedgerPaths
 from live_ledger import LiveLedger
+import threading
+from fee_service import FeeService
+import web_server
+
+MARKET_FETCH_TIMEOUT_SECONDS = float(os.getenv("MARKET_FETCH_TIMEOUT_SECONDS", "30"))
+SKIP_MARKET_FETCH = os.getenv("SKIP_MARKET_FETCH", "0") in ("1", "true", "True")
+WEB_PORT = int(os.getenv("WEB_PORT", "8848"))
+HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "5"))
 
 
 def build_executor(mode: str) -> OrderExecutor:
@@ -23,15 +32,30 @@ def build_executor(mode: str) -> OrderExecutor:
     return PaperExecutor()
 
 
+def fetch_asset_markets(asset, cfg, gamma_client):
+    res = []
+    try:
+        if cfg.polymarket.enable_hourly:
+            res.extend(
+                gamma_client.discover_updown_markets_hourly(asset, cfg.strategy.hourly_horizon_minutes)
+            )
+        if cfg.polymarket.enable_15m:
+            res.extend(gamma_client.discover_updown_markets_15m(asset, cfg.strategy.m15_horizon_minutes))
+    except Exception:
+        pass
+    return res
+
+
 def main():
     cfg = load_config()
-    http = HttpClient(timeout=5.0)
+    http = HttpClient(timeout=HTTP_TIMEOUT_SECONDS)
     gamma_client = PolymarketGammaClient(cfg.polymarket, http)
     binance_client = BinanceClient(cfg.binance, http)
     clob_client = PolymarketClobClient(cfg.polymarket, http)
     strategy = UpDownLagArbStrategy(cfg.strategy, cfg.binance, cfg.polymarket, binance_client, clob_client)
     executor = build_executor(cfg.mode)
     data_api = PolymarketDataApiClient(cfg.polymarket, http)
+    fee_service = FeeService(http, binance_client, cfg.strategy)
     store = JsonStateStore(cfg.strategy.state_file_path, cfg.strategy.max_state_age_hours)
     notifier = FeishuNotifier(webhook_url=cfg.feishu_webhook_url, enabled=bool(cfg.feishu_webhook_url))
     ledger = None
@@ -44,9 +68,15 @@ def main():
     if cfg.mode == "live":
         live_ledger = LiveLedger(trades_path=cfg.live_trades_file_path, stats_path=cfg.live_stats_file_path)
     manager = OrderManager(
-        cfg, executor, data_api, binance_client, store, ledger=ledger, live_ledger=live_ledger, notifier=notifier
+        cfg, executor, data_api, binance_client, store, ledger=ledger, live_ledger=live_ledger, notifier=notifier, strategy=strategy, fee_service=fee_service
     )
     manager.load()
+
+    # Start Web Dashboard
+    t = threading.Thread(target=web_server.start_server, args=(manager, WEB_PORT), daemon=True)
+    t.start()
+    print(f"Web Dashboard started at http://localhost:{WEB_PORT}")
+
     assets = list(cfg.polymarket.series_slugs_hourly.keys())
     run_once = os.getenv("RUN_ONCE", "0") == "1"
     start_ts = datetime.now(timezone.utc).isoformat()
@@ -62,13 +92,36 @@ def main():
     while True:
         try:
             all_markets = []
-            for asset in assets:
-                if cfg.polymarket.enable_hourly:
-                    all_markets.extend(
-                        gamma_client.discover_updown_markets_hourly(asset, cfg.strategy.hourly_horizon_minutes)
-                    )
-                if cfg.polymarket.enable_15m:
-                    all_markets.extend(gamma_client.discover_updown_markets_15m(asset, cfg.strategy.m15_horizon_minutes))
+
+            if SKIP_MARKET_FETCH:
+                if run_once:
+                    return
+                time.sleep(cfg.poll_interval_seconds)
+                continue
+            
+            # 使用多线程并行获取市场数据，避免单线程阻塞
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=min(len(assets) + 1, 8))
+            try:
+                futures = [executor.submit(fetch_asset_markets, asset, cfg, gamma_client) for asset in assets]
+                done, not_done = concurrent.futures.wait(futures, timeout=MARKET_FETCH_TIMEOUT_SECONDS)
+                for future in done:
+                    try:
+                        markets = future.result()
+                        if markets:
+                            all_markets.extend(markets)
+                    except Exception:
+                        pass
+                for future in not_done:
+                    try:
+                        future.cancel()
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    executor.shutdown(wait=False)
+
             orders = strategy.generate_orders(all_markets)
             for order in orders:
                 manager.submit_with_risk(order)

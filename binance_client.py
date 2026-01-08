@@ -27,6 +27,19 @@ class BinanceClient:
         vol_pct = self._stdev_minute_log_returns(data)
         return open_price, close_price, change_pct, vol_pct
 
+    def get_price(self, symbol: str) -> float:
+        """
+        Get current price for a symbol (e.g. 'MATICUSDT').
+        Does not use symbol_map, expects raw Binance symbol.
+        """
+        base = f"{self.cfg.base_url}/api/v3/ticker/price"
+        params = {"symbol": symbol}
+        url = base + "?" + urllib.parse.urlencode(params)
+        data = self.http.get_json(url, {"accept": "application/json"})
+        if not data or "price" not in data:
+            raise RuntimeError(f"Failed to get price for {symbol}")
+        return float(data["price"])
+
     def _get_klines_1m(self, symbol_key: str, start_time: datetime, end_time: datetime) -> List[list]:
         symbol = self.cfg.symbol_map[symbol_key]
         base = f"{self.cfg.base_url}/api/v3/klines"

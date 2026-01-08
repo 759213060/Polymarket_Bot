@@ -1,0 +1,28 @@
+# 改进清单 / Improvement Checklist
+
+## 🔴 严重 / Critical (必须修复 / Must Fix)
+1. [x] **修复实盘风控失效问题 (Fix Live Mode Risk Management)**
+   - **状态**: 已修复 (Fixed)
+   - **说明**: `order_manager.py` 现在会在所有模式下计算胜负并更新策略状态。
+
+2. [x] **修复内存泄漏 (Fix Memory Leak)**
+   - **状态**: 已修复 (Fixed)
+   - **说明**: `strategy_updown_lag_arb.py` 现包含清理过期键值的逻辑。
+
+## 🟠 中等 / Medium (建议优化 / Recommended)
+3. [x] **配置解耦 (Decouple Configuration)**
+   - **状态**: 已修复 (Fixed)
+   - **说明**: 新增 `markets.json`，`config.py` 优先从中读取配置。
+
+4. [x] **优化并发性能 (Optimize Concurrency)**
+   - **状态**: 已修复 (Fixed)
+   - **说明**: `runner_live.py` 使用 `ThreadPoolExecutor` 并行处理市场发现。
+
+## 🟡 低优先级 / Low (代码质量 / Code Quality)
+5. [x] **依赖管理 (Dependency Management)**
+   - **状态**: 已修复 (Fixed)
+   - **说明**: `order_executor.py` 移除了动态 import，显式声明依赖。`requirements.txt` 已确认。
+
+6. [ ] **规范化日志 (Standardize Logging)**
+   - **问题**: 使用 `print` 或忽略异常。
+   - **方案**: 引入 Python `logging` 模块。建议作为后续专项任务处理。

@@ -54,18 +54,18 @@ class PaperLedger:
         _save_json(
             self.paths.stats_path,
             {
-                "initial_cash": float(self.initial_cash),
-                "cash": float(self.initial_cash),
-                "realized_pnl": 0.0,
-                "fees_paid": 0.0,
-                "buy_count": 0,
-                "settle_count": 0,
-                "win_count": 0,
-                "loss_count": 0,
-                "total_buy_notional": 0.0,
-                "total_payout": 0.0,
-                "created_at": now,
-                "updated_at": now,
+                "初始资金": float(self.initial_cash),
+                "当前余额": float(self.initial_cash),
+                "已实现盈亏": 0.0,
+                "手续费总计": 0.0,
+                "买入次数": 0,
+                "结算次数": 0,
+                "盈利次数": 0,
+                "亏损次数": 0,
+                "总买入金额": 0.0,
+                "总结算金额": 0.0,
+                "创建时间": now,
+                "更新时间": now,
             },
         )
 
@@ -125,10 +125,10 @@ class PaperLedger:
         st = _load_json(self.paths.stats_path) or {}
         self._update_stats(
             {
-                "cash": float(cash_after),
-                "fees_paid": float(st.get("fees_paid") or 0.0) + float(fee_paid),
-                "buy_count": int(st.get("buy_count") or 0) + 1,
-                "total_buy_notional": float(st.get("total_buy_notional") or 0.0) + float(notional),
+                "当前余额": float(cash_after),
+                "手续费总计": float(st.get("手续费总计") or 0.0) + float(fee_paid),
+                "买入次数": int(st.get("买入次数") or 0) + 1,
+                "总买入金额": float(st.get("总买入金额") or 0.0) + float(notional),
             }
         )
 
@@ -181,12 +181,12 @@ class PaperLedger:
         st = _load_json(self.paths.stats_path) or {}
         self._update_stats(
             {
-                "cash": float(cash_after),
-                "realized_pnl": float(st.get("realized_pnl") or 0.0) + float(pnl),
-                "settle_count": int(st.get("settle_count") or 0) + 1,
-                "win_count": int(st.get("win_count") or 0) + (1 if win else 0),
-                "loss_count": int(st.get("loss_count") or 0) + (0 if win else 1),
-                "total_payout": float(st.get("total_payout") or 0.0) + float(payout),
+                "当前余额": float(cash_after),
+                "已实现盈亏": float(st.get("已实现盈亏") or 0.0) + float(pnl),
+                "结算次数": int(st.get("结算次数") or 0) + 1,
+                "盈利次数": int(st.get("盈利次数") or 0) + (1 if win else 0),
+                "亏损次数": int(st.get("亏损次数") or 0) + (0 if win else 1),
+                "总结算金额": float(st.get("总结算金额") or 0.0) + float(payout),
             }
         )
 

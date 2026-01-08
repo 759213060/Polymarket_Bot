@@ -1,0 +1,14 @@
+{
+    "binance": {
+        "BTC": "BTCUSDT",
+        "ETH": "ETHUSDT",
+        "XRP": "XRPUSDT",
+        "SOL": "SOLUSDT"
+    },
+    "polymarket": {
+        "BTC": "btc-up-or-down-hourly",
+        "ETH": "eth-up-or-down-hourly",
+        "XRP": "xrp-up-or-down-hourly",
+        "SOL": "sol-up-or-down-hourly"
+    }
+}

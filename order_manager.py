@@ -1,7 +1,9 @@
+import json
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from config import AppConfig
 from binance_client import BinanceClient
@@ -11,11 +13,14 @@ from live_ledger import LiveLedger
 from paper_ledger import PaperLedger
 from polymarket_data_api import PolymarketDataApiClient
 from state_store import JsonStateStore
+from fee_service import FeeService
 
 
 @dataclass
 class PositionSnapshot:
     token_sizes: Dict[str, float]
+    token_values_usd: Dict[str, float]
+    total_value_usd: float
     updated_at: float
 
 
@@ -30,6 +35,8 @@ class OrderManager:
         ledger: Optional[PaperLedger] = None,
         live_ledger: Optional[LiveLedger] = None,
         notifier: Optional[FeishuNotifier] = None,
+        strategy: Optional[Any] = None,
+        fee_service: Optional[FeeService] = None,
     ):
         self.cfg = cfg
         self.executor = executor
@@ -39,11 +46,18 @@ class OrderManager:
         self.ledger = ledger
         self.live_ledger = live_ledger
         self.notifier = notifier
-        self.positions = PositionSnapshot(token_sizes={}, updated_at=0.0)
+        self.strategy = strategy
+        self.fee_service = fee_service
+        self.positions = PositionSnapshot(token_sizes={}, token_values_usd={}, total_value_usd=0.0, updated_at=0.0)
+        self.raw_positions: List[Dict] = []
         self.last_status_poll = 0.0
+        self.equity_history: List[Dict] = [] # List of {"ts": float, "equity": float}
+        self.last_history_record = 0.0
         self.live_cash_usd = float(cfg.live_cash_usd or 0.0)
         self.live_cash_updated_at = 0.0
         self.live_cash_spent_local_until = 0.0
+        self.live_total_value_usd: Optional[float] = None
+        self.live_positions_value_usd: Optional[float] = None
         self._live_activity_seen = set()
         seen = self.store.state.get("live_activity_seen") or []
         if isinstance(seen, list):
@@ -59,6 +73,131 @@ class OrderManager:
         t = str(ev.get("type") or ev.get("event") or "")
         m = str(ev.get("market") or ev.get("market_slug") or ev.get("conditionId") or "")
         return ts + "|" + t + "|" + m
+
+    def _load_recent_trades(self, limit: int = 50) -> List[Dict[str, Any]]:
+        path: str | None = None
+        if self.cfg.mode == "paper":
+            if self.ledger and hasattr(self.ledger, "paths"):
+                path = getattr(self.ledger.paths, "trades_path", None)
+        elif self.cfg.mode == "live":
+            if self.live_ledger and hasattr(self.live_ledger, "trades_path"):
+                path = getattr(self.live_ledger, "trades_path", None)
+        if not path or not isinstance(path, str) or not path:
+            return []
+        if not os.path.exists(path):
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return []
+        if not isinstance(data, list) or not data:
+            return []
+        rows = data[-limit:]
+        out: List[Dict[str, Any]] = []
+        for r in reversed(rows):
+            if not isinstance(r, dict):
+                continue
+            ts_raw = r.get("ts")
+            ts_iso = None
+            try:
+                if ts_raw is not None:
+                    ts_iso = datetime.fromtimestamp(float(ts_raw), tz=timezone.utc).isoformat()
+            except Exception:
+                ts_iso = None
+
+            if self.cfg.mode == "paper":
+                ev = str(r.get("event") or "")
+                if ev == "buy":
+                    out.append(
+                        {
+                            "ts": ts_iso,
+                            "type": "buy",
+                            "market": r.get("market_slug") or "",
+                            "symbol": r.get("asset_symbol") or "",
+                            "outcome": r.get("outcome") or "",
+                            "notional": r.get("notional"),
+                            "price": r.get("price"),
+                            "size": r.get("size"),
+                            "fee": r.get("fee_paid"),
+                            "pnl": None,
+                            "result": "",
+                            "detail": r.get("order_type") or "",
+                            "link": f"https://polymarket.com/event/{(r.get('market_slug') or '')}" if r.get("market_slug") else "#",
+                        }
+                    )
+                elif ev == "settle":
+                    win = bool(r.get("win"))
+                    out.append(
+                        {
+                            "ts": ts_iso,
+                            "type": "settle",
+                            "market": r.get("market_slug") or "",
+                            "symbol": r.get("asset_symbol") or "",
+                            "outcome": r.get("predicted_outcome") or "",
+                            "notional": r.get("total_notional"),
+                            "price": None,
+                            "size": r.get("total_size"),
+                            "fee": r.get("fee_paid"),
+                            "pnl": r.get("pnl"),
+                            "result": "win" if win else "lose",
+                            "detail": f"{r.get('actual_outcome') or ''} {r.get('change_pct') or ''}",
+                            "link": f"https://polymarket.com/event/{(r.get('market_slug') or '')}" if r.get("market_slug") else "#",
+                        }
+                    )
+                else:
+                    out.append({"ts": ts_iso, "type": ev or "paper", "detail": str(r)[:500]})
+            else:
+                typ = str(r.get("type") or "")
+                if typ == "order_submit":
+                    d = r.get("data") if isinstance(r.get("data"), dict) else {}
+                    out.append(
+                        {
+                            "ts": ts_iso,
+                            "type": "order_submit",
+                            "market": d.get("market_slug") or "",
+                            "symbol": d.get("asset_symbol") or "",
+                            "outcome": d.get("outcome") or "",
+                            "notional": d.get("notional"),
+                            "price": d.get("price"),
+                            "size": d.get("size"),
+                            "fee": d.get("fee_estimated") or d.get("fee_est"),
+                            "pnl": None,
+                            "result": "",
+                            "detail": d.get("order_id") or "",
+                            "link": f"https://polymarket.com/event/{(d.get('market_slug') or '')}" if d.get("market_slug") else "#",
+                        }
+                    )
+                elif typ == "activity":
+                    raw = r.get("raw") if isinstance(r.get("raw"), dict) else {}
+                    pnl = None
+                    for k in ("pnl", "cash_pnl", "cashPnl", "realizedPnl", "realized_pnl"):
+                        if k in raw:
+                            try:
+                                pnl = float(raw.get(k))
+                            except Exception:
+                                pnl = None
+                            break
+                    out.append(
+                        {
+                            "ts": ts_iso,
+                            "type": "activity",
+                            "market": "",
+                            "symbol": raw.get("asset") or raw.get("symbol") or "",
+                            "outcome": raw.get("outcome") or "",
+                            "notional": raw.get("notional") or raw.get("amount") or raw.get("value"),
+                            "price": raw.get("price") or raw.get("avgPrice"),
+                            "size": raw.get("size"),
+                            "fee": raw.get("fee") or raw.get("fees") or raw.get("feePaid") or raw.get("fee_paid"),
+                            "pnl": pnl,
+                            "result": "",
+                            "detail": raw.get("type") or raw.get("action") or "",
+                            "link": "#",
+                        }
+                    )
+                else:
+                    out.append({"ts": ts_iso, "type": typ or "live", "detail": str(r)[:500]})
+        return out
 
     def _notify(self, text: str) -> None:
         n = self.notifier
@@ -98,7 +237,10 @@ class OrderManager:
         if now - self.positions.updated_at < self.cfg.strategy.positions_refresh_seconds:
             return
         raw = self.data_api.get_positions(wallet, size_threshold=0.0, limit=500, offset=0)
+        self.raw_positions = raw
         token_sizes: Dict[str, float] = {}
+        token_values_usd: Dict[str, float] = {}
+        total_value_usd = 0.0
         for p in raw:
             token = str(
                 p.get("asset")
@@ -116,7 +258,16 @@ class OrderManager:
                 size = 0.0
             if size:
                 token_sizes[token] = token_sizes.get(token, 0.0) + size
-        self.positions = PositionSnapshot(token_sizes=token_sizes, updated_at=now)
+            v = self._extract_position_value_usd(p)
+            if v is None:
+                v = self._estimate_position_value_usd(p)
+            if v is not None:
+                v = float(max(v, 0.0))
+                token_values_usd[token] = token_values_usd.get(token, 0.0) + v
+                total_value_usd += v
+        self.positions = PositionSnapshot(
+            token_sizes=token_sizes, token_values_usd=token_values_usd, total_value_usd=float(total_value_usd), updated_at=now
+        )
 
     def _extract_cash_usd(self, value: dict) -> Optional[float]:
         candidates = [
@@ -142,6 +293,91 @@ class OrderManager:
                     continue
         return None
 
+    def _extract_total_value_usd(self, value: dict) -> Optional[float]:
+        candidates = [
+            "totalValue",
+            "total_value",
+            "accountValue",
+            "account_value",
+            "portfolioValue",
+            "portfolio_value",
+            "netWorth",
+            "net_worth",
+            "equity",
+            "value",
+        ]
+        for k in candidates:
+            if k in value:
+                try:
+                    raw = value.get(k)
+                    if raw is None:
+                        continue
+                    return float(raw)
+                except Exception:
+                    continue
+        return None
+
+    def _extract_positions_value_usd(self, value: dict) -> Optional[float]:
+        candidates = [
+            "positionsValue",
+            "positions_value",
+            "positionValue",
+            "position_value",
+            "holdingsValue",
+            "holdings_value",
+        ]
+        for k in candidates:
+            if k in value:
+                try:
+                    raw = value.get(k)
+                    if raw is None:
+                        continue
+                    return float(raw)
+                except Exception:
+                    continue
+        return None
+
+    def _extract_position_value_usd(self, p: dict) -> Optional[float]:
+        candidates = [
+            "currentValue",
+            "current_value",
+            "value",
+            "usdValue",
+            "usd_value",
+            "positionValue",
+            "position_value",
+        ]
+        for k in candidates:
+            if k in p:
+                try:
+                    raw = p.get(k)
+                    if raw is None:
+                        continue
+                    return float(raw)
+                except Exception:
+                    continue
+        return None
+
+    def _estimate_position_value_usd(self, p: dict) -> Optional[float]:
+        try:
+            size = float(p.get("size") or p.get("positionSize") or p.get("position_size") or 0.0)
+        except Exception:
+            size = 0.0
+        avg = None
+        for k in ("avgPrice", "avg_price", "averagePrice", "average_price", "costBasis", "cost_basis"):
+            if k in p:
+                try:
+                    raw = p.get(k)
+                    if raw is None:
+                        continue
+                    avg = float(raw)
+                    break
+                except Exception:
+                    continue
+        if avg is None:
+            return None
+        return float(abs(size) * avg)
+
     def refresh_live_cash_if_needed(self) -> None:
         if self.cfg.mode != "live":
             return
@@ -162,6 +398,8 @@ class OrderManager:
         if not isinstance(v, dict):
             return
         cash = self._extract_cash_usd(v)
+        total_value = self._extract_total_value_usd(v)
+        positions_value = self._extract_positions_value_usd(v)
         if cash is not None:
             cash = float(cash)
             if time.time() < float(self.live_cash_spent_local_until or 0.0):
@@ -169,6 +407,10 @@ class OrderManager:
                     self.live_cash_usd = cash
             else:
                 self.live_cash_usd = cash
+        if total_value is not None:
+            self.live_total_value_usd = float(total_value)
+        if positions_value is not None:
+            self.live_positions_value_usd = float(positions_value)
         if self.live_ledger:
             try:
                 self.live_ledger.save_value_snapshot(v, cash_usd=cash)
@@ -237,8 +479,97 @@ class OrderManager:
                 n += 1
         return n
 
+    def _open_orders_notional(self, statuses: List[str]) -> float:
+        orders = self.store.state.get("orders") or {}
+        total = 0.0
+        allow = {s.lower() for s in statuses}
+        for _, st in list(orders.items()):
+            status = (st.get("status") or "").lower()
+            if status not in allow:
+                continue
+            try:
+                total += float(st.get("total_notional") or 0.0)
+            except Exception:
+                continue
+        return float(total)
+
+    def _live_open_orders_notional(self) -> float:
+        orders = self.store.state.get("orders") or {}
+        total = 0.0
+        for _, st in list(orders.items()):
+            status = (st.get("status") or "").lower()
+            if status == "submitted":
+                try:
+                    total += float(st.get("total_notional") or 0.0)
+                except Exception:
+                    continue
+                continue
+            if status == "filled":
+                token_id = str(st.get("token_id") or "")
+                if token_id:
+                    try:
+                        if float(self.positions.token_sizes.get(token_id) or 0.0) > 0.0:
+                            continue
+                    except Exception:
+                        pass
+                try:
+                    total += float(st.get("total_notional") or 0.0)
+                except Exception:
+                    continue
+        return float(total)
+
+    def _max_total_exposure_usd(self) -> float:
+        frac = float(getattr(self.cfg, "max_total_exposure_fraction", 0.0) or 0.0)
+        if frac <= 0:
+            return 0.0
+        threshold = float(self.cfg.live_roll_threshold_usd or 0.0)
+        below_cap = float(self.cfg.live_max_notional_below_threshold or 0.0)
+        if self.cfg.mode == "paper":
+            cash = self._paper_cash()
+            open_notional = self._open_orders_notional(["submitted", "filled"])
+            equity = float(cash) + float(open_notional)
+            if threshold > 0 and equity < threshold:
+                return float(max(below_cap, 0.0))
+            return float(max(equity * frac, 0.0))
+        cash = float(self.live_cash_usd or 0.0)
+        open_orders = self._live_open_orders_notional()
+        if self.live_total_value_usd is not None:
+            equity = float(self.live_total_value_usd)
+            if threshold > 0 and equity < threshold:
+                return float(max(below_cap, 0.0))
+            return float(max(equity * frac, 0.0))
+        positions_value = float(
+            self.live_positions_value_usd
+            if self.live_positions_value_usd is not None
+            else float(self.positions.total_value_usd or 0.0)
+        )
+        equity = cash + positions_value + float(open_orders)
+        if threshold > 0 and equity < threshold:
+            return float(max(below_cap, 0.0))
+        return float(max(equity * frac, 0.0))
+
+    def _current_total_exposure_usd(self) -> float:
+        if self.cfg.mode == "paper":
+            return float(max(self._open_orders_notional(["submitted", "filled"]), 0.0))
+        positions_value = float(
+            self.live_positions_value_usd
+            if self.live_positions_value_usd is not None
+            else float(self.positions.total_value_usd or 0.0)
+        )
+        open_orders = self._live_open_orders_notional()
+        return float(max(positions_value + float(open_orders), 0.0))
+
+    def _remaining_total_exposure_usd(self) -> float:
+        cap = self._max_total_exposure_usd()
+        used = self._current_total_exposure_usd()
+        return float(max(cap - used, 0.0))
+
     def _paper_apply_buy(self, notional: float) -> float:
-        fee = float(self.cfg.strategy.fee_estimate) * float(notional)
+        if self.fee_service:
+            fee_rate = self.fee_service.get_trade_fee_rate()
+        else:
+            fee_rate = float(self.cfg.strategy.fee_estimate)
+        fee = fee_rate * float(notional)
         paper = self.store.state.get("paper") or {}
         cash = float(paper.get("cash") or 0.0)
         cash -= float(notional) + fee
@@ -248,10 +579,11 @@ class OrderManager:
         self.store.state["paper"] = paper
         return fee
 
-    def _paper_apply_settlement(self, pnl: float, payout: float, win: bool) -> None:
+    def _paper_apply_settlement(self, pnl: float, payout: float, win: bool, settlement_fee: float = 0.0) -> None:
         paper = self.store.state.get("paper") or {}
-        paper["cash"] = float(paper.get("cash") or 0.0) + float(payout)
+        paper["cash"] = float(paper.get("cash") or 0.0) + float(payout) - settlement_fee
         paper["realized_pnl"] = float(paper.get("realized_pnl") or 0.0) + float(pnl)
+        paper["fees_paid"] = float(paper.get("fees_paid") or 0.0) + settlement_fee
         if win:
             paper["wins"] = int(paper.get("wins") or 0) + 1
         else:
@@ -318,6 +650,9 @@ class OrderManager:
         for child in children:
             if datetime.now(timezone.utc) >= child.end_time:
                 continue
+            exposure_remaining = self._remaining_total_exposure_usd()
+            if exposure_remaining <= 0:
+                break
             if self.cfg.mode == "paper":
                 if self._paper_open_orders_count() >= int(self.cfg.paper_max_open_orders):
                     break
@@ -327,7 +662,7 @@ class OrderManager:
                 fee_rate = float(self.cfg.strategy.fee_estimate)
                 spendable = cash / (1.0 + fee_rate) if fee_rate >= 0 else cash
                 max_by_fraction = spendable * float(self.cfg.paper_max_fraction_per_trade)
-                notional = min(child.notional, spendable, max_by_fraction)
+                notional = min(child.notional, spendable, max_by_fraction, float(exposure_remaining))
                 if notional < float(self.cfg.paper_min_notional):
                     break
                 if abs(notional - child.notional) > 1e-9:
@@ -347,10 +682,13 @@ class OrderManager:
             if self.cfg.mode == "live":
                 cap = self._live_max_notional()
                 cash = float(self.live_cash_usd or 0.0)
-                fee_rate = float(self.cfg.strategy.fee_estimate)
+                if self.fee_service:
+                    fee_rate = self.fee_service.get_trade_fee_rate()
+                else:
+                    fee_rate = float(self.cfg.strategy.fee_estimate)
                 spendable = cash / (1.0 + fee_rate) if fee_rate >= 0 else cash
                 if cap > 0:
-                    notional = min(float(child.notional), float(cap), float(spendable))
+                    notional = min(float(child.notional), float(cap), float(spendable), float(exposure_remaining))
                     if notional < float(self.cfg.live_min_notional):
                         break
                     if abs(notional - child.notional) > 1e-9:
@@ -385,7 +723,10 @@ class OrderManager:
                 )
                 if self.cfg.mode == "live":
                     cash_before = float(self.live_cash_usd or 0.0)
-                    fee_est = float(self.cfg.strategy.fee_estimate) * float(child.notional)
+                    if self.fee_service:
+                        fee_est = self.fee_service.get_trade_fee_rate() * float(child.notional)
+                    else:
+                        fee_est = float(self.cfg.strategy.fee_estimate) * float(child.notional)
                     cash_after = cash_before - float(child.notional) - float(fee_est)
                     self.live_cash_usd = float(max(cash_after, 0.0))
                     self.live_cash_spent_local_until = time.time() + float(self.cfg.live_balance_refresh_seconds) * 2.0
@@ -523,19 +864,41 @@ class OrderManager:
                 try:
                     end_dt = datetime.fromisoformat(end_time.replace("Z", "+00:00")).astimezone(timezone.utc)
                     if datetime.now(timezone.utc) > end_dt:
-                        if self.cfg.mode == "paper":
-                            start_raw = str(st.get("start_time") or "")
+                        # 通用逻辑：获取Binance价格判断胜负，用于更新策略风控状态
+                        start_raw = str(st.get("start_time") or "")
+                        win = False
+                        actual = "Unknown"
+                        open_p, close_p, chg = 0.0, 0.0, 0.0
+                        
+                        try:
                             if start_raw:
                                 start_dt = datetime.fromisoformat(start_raw.replace("Z", "+00:00")).astimezone(timezone.utc)
                                 open_p, close_p, chg = self.binance.get_open_close_change(asset_symbol, start_dt, end_dt)
                                 actual = "Up" if chg > 0 else "Down"
                                 win = actual == outcome
+                                
+                                # 更新策略风控状态 (无论是 Paper 还是 Live)
+                                if self.strategy and hasattr(self.strategy, 'update_trade_result'):
+                                    try:
+                                        self.strategy.update_trade_result(asset_symbol, win)
+                                    except Exception:
+                                        pass
+                        except Exception as e:
+                            # 如果获取价格失败，可能稍后重试，或者标记为未知
+                            pass
+
+                        if self.cfg.mode == "paper":
+                            if start_raw:
                                 total_notional = float(st.get("total_notional") or 0.0)
                                 total_size = float(st.get("total_size") or 0.0)
                                 fee_paid = float(st.get("fee_paid") or 0.0)
                                 payout = total_size if win else 0.0
-                                pnl = payout - total_notional - fee_paid
-                                self._paper_apply_settlement(pnl=pnl, payout=payout, win=win)
+                                settlement_fee = 0.0
+                                if self.fee_service:
+                                    settlement_fee = self.fee_service.get_settlement_fee_usd()
+                                
+                                pnl = payout - total_notional - fee_paid - settlement_fee
+                                self._paper_apply_settlement(pnl=pnl, payout=payout, win=win, settlement_fee=settlement_fee)
                                 cash_after = self._paper_cash()
                                 if self.ledger:
                                     try:
@@ -563,6 +926,7 @@ class OrderManager:
                                 orders[key]["status"] = "settled"
                                 orders[key]["result"] = "win" if win else "lose"
                                 orders[key]["settled_at"] = self._utc_now()
+                                
                                 self._notify(
                                     "模拟仓结算\n"
                                     + f"时间(UTC)：{self._utc_now()}\n"
@@ -582,6 +946,8 @@ class OrderManager:
                                 )
                                 self.store.save()
                                 continue
+                        
+                        # Live 模式下的处理 (保留原有的过期通知，但现在已经更新了策略状态)
                         orders[key]["status"] = "expired"
                         orders[key]["updated_at"] = now
                         self._notify(
@@ -599,3 +965,102 @@ class OrderManager:
                     pass
         self.store.state["orders"] = orders
         self.store.save()
+
+    def _update_history(self, equity: float):
+        now = time.time()
+        # Record every 60 seconds
+        if now - self.last_history_record >= 60:
+            self.equity_history.append({"ts": now * 1000, "value": equity})
+            # Keep last 1440 points
+            if len(self.equity_history) > 1440:
+                self.equity_history.pop(0)
+            self.last_history_record = now
+
+    def get_dashboard_stats(self) -> Dict[str, Any]:
+        """Return stats for web dashboard."""
+        mode = self.cfg.mode
+        stats = {
+            "mode": mode,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "cash": 0.0,
+            "equity": 0.0,
+            "pnl": 0.0,
+            "positions": [],
+            "recent_trades": [],
+            "history": []
+        }
+        stats["recent_trades"] = self._load_recent_trades(limit=50)
+
+        if mode == "paper":
+            paper = self.store.state.get("paper") or {}
+            cash = float(paper.get("cash") or 0.0)
+            stats["cash"] = cash
+            stats["pnl"] = float(paper.get("realized_pnl") or 0.0)
+            
+            orders = self.store.state.get("orders") or {}
+            pos_list = []
+            equity_adjustment = 0.0
+            
+            for k, v in orders.items():
+                status = (v.get("status") or "").lower()
+                if status not in ("submitted", "filled"):
+                    continue
+                size = float(v.get("total_size") or 0.0)
+                if size <= 0:
+                    continue
+                
+                notional = float(v.get("total_notional") or 0.0)
+                price = notional / size if size > 0 else 0.0
+                
+                symbol = v.get("asset_symbol") or "?"
+                outcome = v.get("outcome") or "?"
+                market = v.get("market_slug") or ""
+                val = size * price 
+                equity_adjustment += val
+                
+                pos_list.append({
+                    "market": market,
+                    "symbol": symbol,
+                    "outcome": outcome,
+                    "size": size,
+                    "entry_price": price,
+                    "value": val,
+                    "link": f"https://polymarket.com/event/{market}" if market else "#"
+                })
+            
+            stats["equity"] = cash + equity_adjustment
+            stats["positions"] = pos_list
+
+        elif mode == "live":
+            stats["cash"] = self.live_cash_usd
+            stats["equity"] = self.live_total_value_usd if self.live_total_value_usd else self.live_cash_usd
+            
+            pos_list = []
+            for p in self.raw_positions:
+                size = float(p.get("size") or 0.0)
+                if size < 0.000001: continue
+                asset = p.get("asset") or "?"
+                title = p.get("title") or asset
+                market_slug = p.get("slug") or ""
+                
+                if not market_slug and "market" in p and isinstance(p["market"], dict):
+                    market_slug = p["market"].get("slug") or ""
+
+                cur_val = self._extract_position_value_usd(p)
+                if cur_val is None:
+                    cur_val = self._estimate_position_value_usd(p) or 0.0
+                
+                pos_list.append({
+                    "market": title,
+                    "symbol": asset,
+                    "outcome": p.get("outcome") or "?",
+                    "size": size,
+                    "entry_price": float(p.get("avgPrice") or 0.0),
+                    "value": cur_val,
+                    "link": f"https://polymarket.com/event/{market_slug}" if market_slug else "#"
+                })
+            stats["positions"] = pos_list
+        
+        self._update_history(stats["equity"])
+        stats["history"] = self.equity_history
+        return stats
