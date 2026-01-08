@@ -880,7 +880,7 @@ class OrderManager:
                                 # 更新策略风控状态 (无论是 Paper 还是 Live)
                                 if self.strategy and hasattr(self.strategy, 'update_trade_result'):
                                     try:
-                                        self.strategy.update_trade_result(asset_symbol, win)
+                                        self.strategy.update_trade_result(asset_symbol, win, market_slug=str(st.get("market_slug") or ""))
                                     except Exception:
                                         pass
                         except Exception as e:

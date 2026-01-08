@@ -9,20 +9,59 @@
    - **状态**: 已修复 (Fixed)
    - **说明**: `strategy_updown_lag_arb.py` 现包含清理过期键值的逻辑。
 
+3. [x] **避免策略状态集合无限增长 (Prevent Unbounded Growth in Strategy State)**
+   - **状态**: 已修复 (Fixed)
+   - **说明**: `strategy_updown_lag_arb.py` 现在会定期 TTL 清理并限制最大容量。
+
+4. [x] **防止账本文件无限膨胀 (Prevent Ledger Files from Growing Unbounded)**
+   - **状态**: 已修复 (Fixed)
+   - **说明**: `paper_ledger.py`/`live_ledger.py` 追加时会截断保留最近 N 条（默认 5000，可用 `LEDGER_MAX_RECORDS` 调整）。
+
 ## 🟠 中等 / Medium (建议优化 / Recommended)
-3. [x] **配置解耦 (Decouple Configuration)**
+5. [x] **配置解耦 (Decouple Configuration)**
    - **状态**: 已修复 (Fixed)
    - **说明**: 新增 `markets.json`，`config.py` 优先从中读取配置。
 
-4. [x] **优化并发性能 (Optimize Concurrency)**
+6. [x] **优化并发性能 (Optimize Concurrency)**
    - **状态**: 已修复 (Fixed)
    - **说明**: `runner_live.py` 使用 `ThreadPoolExecutor` 并行处理市场发现。
 
+7. [ ] **减少吞异常导致的静默失败 (Reduce Silent Failures from Swallowed Exceptions)**
+   - **问题**: `runner_live.py`、`order_manager.py` 等多处 `except Exception: pass`，失败时难以及时发现，可能导致不交易或数据不更新。
+   - **方案**: 统一记录异常（带上下文）、按频率限流通知、对关键路径失败做降级/重试策略。
+
+8. [ ] **复用线程池并避免变量名覆盖 (Reuse ThreadPoolExecutor)**
+   - **问题**: 主循环每轮新建 `ThreadPoolExecutor`，且覆盖了 `executor` 变量名（与下单 executor 同名），增加开销与可读性风险。
+   - **方案**: 初始化一次复用，或明确区分命名（如 `market_fetch_pool`）。
+
+9. [ ] **市场发现与报价缓存 (Cache Market Discovery and Quotes)**
+   - **问题**: `polymarket_gamma.py` 的 15m 市场发现按时间点逐个请求，容易触发速率限制；`get_best_ask` 也可能在短时间重复查询同一 token。
+   - **方案**: 增量/批量拉取 + TTL 缓存，降低 API 压力与延迟。
+
+10. [ ] **Dashboard 默认只绑定本机 (Bind Web Dashboard to localhost by default)**
+   - **问题**: `web_server.py` 使用 `0.0.0.0` 监听，默认暴露到局域网，存在信息泄露风险。
+   - **方案**: 默认 `127.0.0.1`，通过环境变量显式开启外网访问。
+
+11. [ ] **HTTP 层增加抖动退避与统一限速 (Add Jitter Backoff & Rate Limiting)**
+   - **问题**: `http_client.py` 退避无抖动且无统一限速；429/5xx 时多客户端并发可能放大重试风暴。
+   - **方案**: 统一限速（按 host/token bucket）、退避加 jitter、对 429 读取 `Retry-After`（如有）。
+
 ## 🟡 低优先级 / Low (代码质量 / Code Quality)
-5. [x] **依赖管理 (Dependency Management)**
+12. [x] **依赖管理 (Dependency Management)**
    - **状态**: 已修复 (Fixed)
    - **说明**: `order_executor.py` 移除了动态 import，显式声明依赖。`requirements.txt` 已确认。
 
-6. [ ] **规范化日志 (Standardize Logging)**
+13. [ ] **规范化日志 (Standardize Logging)**
    - **问题**: 使用 `print` 或忽略异常。
    - **方案**: 引入 Python `logging` 模块。建议作为后续专项任务处理。
+
+14. [ ] **启动参数校验与启动自检 (Config Validation & Startup Checks)**
+   - **问题**: live 模式关键配置缺失时，错误可能在运行中后置触发（例如下单时才报错）。
+   - **方案**: 启动时集中校验必要环境变量/配置项并明确报错。
+
+15. [ ] **补充最小化冒烟测试 (Add Minimal Smoke Tests)**
+   - **范围**: `load_config()`、关键 client 的 URL 拼接、策略 `generate_orders()` 的基本输入输出。
+
+16. [ ] **并发读写一致性 (Thread-Safety for Dashboard Reads)**
+   - **问题**: Web Dashboard 与主循环并发访问 `OrderManager` 状态，存在读到半更新数据的风险。
+   - **方案**: 关键数据快照化/加锁，或在 API 层返回复制后的结构。

@@ -18,6 +18,13 @@ def _save_json(path: str, obj: Any) -> None:
         json.dump(obj, f, ensure_ascii=False, indent=2, sort_keys=True)
     os.replace(tmp, path)
 
+def _max_records() -> int:
+    try:
+        v = int(os.getenv("LEDGER_MAX_RECORDS", "5000"))
+        return max(100, v)
+    except Exception:
+        return 5000
+
 
 def _guess_kind(market_slug: str) -> str:
     s = (market_slug or "").lower()
@@ -74,6 +81,9 @@ class PaperLedger:
         if not isinstance(trades, list):
             trades = []
         trades.append(record)
+        max_n = _max_records()
+        if len(trades) > max_n:
+            trades = trades[-max_n:]
         _save_json(self.paths.trades_path, trades)
 
     def _update_stats(self, patch: Dict[str, Any]) -> None:

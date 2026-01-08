@@ -122,7 +122,12 @@ def main():
                 except TypeError:
                     executor.shutdown(wait=False)
 
-            orders = strategy.generate_orders(all_markets)
+            if cfg.mode == "paper":
+                current_balance = manager._paper_cash()
+            else:
+                current_balance = manager.live_cash_usd
+            
+            orders = strategy.generate_orders(all_markets, current_balance)
             for order in orders:
                 manager.submit_with_risk(order)
             manager.poll_status()

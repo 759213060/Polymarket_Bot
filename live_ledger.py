@@ -17,6 +17,13 @@ def _save_json(path: str, obj: Any) -> None:
         json.dump(obj, f, ensure_ascii=False, indent=2, sort_keys=True)
     os.replace(tmp, path)
 
+def _max_records() -> int:
+    try:
+        v = int(os.getenv("LEDGER_MAX_RECORDS", "5000"))
+        return max(100, v)
+    except Exception:
+        return 5000
+
 
 def _to_float(v: Any) -> Optional[float]:
     if v is None:
@@ -72,6 +79,9 @@ class LiveLedger:
             trades = []
         record = {"ts": now, "type": "order_submit", "data": data}
         trades.append(record)
+        max_n = _max_records()
+        if len(trades) > max_n:
+            trades = trades[-max_n:]
         _save_json(self.trades_path, trades)
 
         st = _load_json(self.stats_path) or {}
@@ -96,6 +106,9 @@ class LiveLedger:
             trades = []
         record = {"ts": now, "type": "activity", "raw": ev}
         trades.append(record)
+        max_n = _max_records()
+        if len(trades) > max_n:
+            trades = trades[-max_n:]
         _save_json(self.trades_path, trades)
 
         st = _load_json(self.stats_path) or {}

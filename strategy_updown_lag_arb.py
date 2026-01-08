@@ -27,11 +27,21 @@ class UpDownLagArbStrategy:
         self.price_history: Dict[str, List[float]] = {}
         self.consecutive_losses: Dict[str, int] = {}  # 连续亏损计数
         self.asset_performance: Dict[str, Dict[str, int]] = {}  # 资产表现统计
+        self.active_positions: Dict[str, List[float]] = {}  # 记录活跃仓位 {market_slug: [notional, timestamp]}
+        self.max_traded_keys: int = 5000
+        self.traded_keys_ttl_seconds: float = 6 * 3600.0
 
-    def generate_orders(self, markets: List[UpDownMarket]) -> List[OrderRequest]:
+    def generate_orders(self, markets: List[UpDownMarket], current_balance: float = None) -> List[OrderRequest]:
         now = datetime.now(timezone.utc)
         orders: List[OrderRequest] = []
         total_notional = 0.0
+
+        self._cleanup_active_positions(now)
+        self._cleanup_traded_keys(now)
+
+        active_position_count = len(self.active_positions)
+
+        max_positions, max_notional_per_trade = self._calculate_position_limits(current_balance)
         for m in markets:
             key = m.market_slug + "|" + m.asset_symbol
             if key in self.traded_keys:
@@ -67,11 +77,11 @@ class UpDownLagArbStrategy:
                 should_trade = True
             
             # 信号2: 中等幅度但高置信度 (0.5%-1%)
-            elif 0.5 <= abs(change_pct) < dynamic_threshold and abs(change_pct) > 0.8 * float(vol or 0.0):
+            elif 0.005 <= abs(change_pct) < dynamic_threshold and abs(change_pct) > 0.8 * float(vol or 0.0):
                 should_trade = True
             
             # 信号3: 趋势延续 (同方向连续波动)
-            elif abs(change_pct) >= 0.3 and self._check_trend_continuation(m.asset_symbol, change_pct > 0):
+            elif abs(change_pct) >= 0.003 and self._check_trend_continuation(m.asset_symbol, change_pct > 0):
                 should_trade = True
             
             # 风险管理: 检查连续亏损
@@ -92,11 +102,18 @@ class UpDownLagArbStrategy:
             edge = 1.0 - best_ask - self.cfg.fee_estimate
             if edge < self.cfg.min_edge:
                 continue
+
+            if active_position_count >= max_positions:
+                continue
+
+            if not self._is_15m_market(m):
+                continue
+
             remaining = self.cfg.max_total_notional - total_notional
             if remaining <= 0:
                 break
             per_market = self.cfg.max_notional_per_market
-            per_trade = self.cfg.max_notional_per_trade
+            per_trade = min(self.cfg.max_notional_per_trade, max_notional_per_trade)
             notional = min(remaining, per_market, per_trade)
             size = notional / best_ask
             order = OrderRequest(
@@ -114,8 +131,10 @@ class UpDownLagArbStrategy:
             total_notional += notional
             self.traded_keys[key] = m.end_time.timestamp()
             self.last_trade_ts_by_asset[m.asset_symbol] = now.timestamp()
-            
-            # 更新价格历史
+
+            self.active_positions[m.market_slug] = [notional, now.timestamp()]
+            active_position_count += 1
+
             if m.asset_symbol not in self.price_history:
                 self.price_history[m.asset_symbol] = []
             self.price_history[m.asset_symbol].append(close_price)
@@ -123,8 +142,7 @@ class UpDownLagArbStrategy:
                 self.price_history[m.asset_symbol].pop(0)
         return orders
     
-    def update_trade_result(self, asset_symbol: str, is_win: bool) -> None:
-        """更新交易结果，用于风险管理"""
+    def update_trade_result(self, asset_symbol: str, is_win: bool, market_slug: str = None) -> None:
         if asset_symbol not in self.consecutive_losses:
             self.consecutive_losses[asset_symbol] = 0
         if asset_symbol not in self.asset_performance:
@@ -136,6 +154,9 @@ class UpDownLagArbStrategy:
         else:
             self.consecutive_losses[asset_symbol] += 1
             self.asset_performance[asset_symbol]["losses"] += 1
+
+        if market_slug and market_slug in self.active_positions:
+            del self.active_positions[market_slug]
     
     def _has_too_many_losses(self, asset_symbol: str) -> bool:
         """检查是否连续亏损过多"""
@@ -158,3 +179,60 @@ class UpDownLagArbStrategy:
         else:
             # 下跌趋势：最近价格应该持续下跌或低位震荡
             return all(recent_prices[i] <= recent_prices[i-1] * 1.02 for i in range(1, len(recent_prices)))
+    
+    def _cleanup_active_positions(self, current_time: datetime) -> None:
+        expired_positions = []
+        for market_slug, (notional, timestamp) in self.active_positions.items():
+            if current_time.timestamp() - timestamp > 900:
+                expired_positions.append(market_slug)
+        
+        for market_slug in expired_positions:
+            del self.active_positions[market_slug]
+
+    def _cleanup_traded_keys(self, current_time: datetime) -> None:
+        now_ts = float(current_time.timestamp())
+        ttl = float(self.traded_keys_ttl_seconds or 0.0)
+        if ttl > 0:
+            cutoff = now_ts - ttl
+            for k, end_ts in list(self.traded_keys.items()):
+                try:
+                    if float(end_ts) < cutoff:
+                        self.traded_keys.pop(k, None)
+                except Exception:
+                    self.traded_keys.pop(k, None)
+        max_n = int(self.max_traded_keys or 0)
+        if max_n > 0 and len(self.traded_keys) > max_n:
+            items = []
+            for k, end_ts in self.traded_keys.items():
+                try:
+                    items.append((k, float(end_ts)))
+                except Exception:
+                    items.append((k, float("-inf")))
+            items.sort(key=lambda x: x[1], reverse=True)
+            keep = {k for (k, _) in items[:max_n]}
+            for k in list(self.traded_keys.keys()):
+                if k not in keep:
+                    self.traded_keys.pop(k, None)
+
+    def _is_15m_market(self, m: UpDownMarket) -> bool:
+        slug = str(m.market_slug or "").lower()
+        if "15m" in slug or "updown-15m" in slug:
+            return True
+        try:
+            duration_min = (m.end_time - m.start_time).total_seconds() / 60.0
+        except Exception:
+            return False
+        if duration_min <= 0:
+            return False
+        return abs(duration_min - 15.0) <= 2.0
+    
+    def _calculate_position_limits(self, current_balance: float) -> tuple:
+        if current_balance is None or current_balance <= 0:
+            return 0, 0.0
+        
+        if current_balance < 10.0:
+            return 3, min(1.0, current_balance * 0.5)
+        else:
+            max_notional_per_trade = min(1.0, current_balance * 0.3)
+            max_positions = min(15, max(3, int(current_balance / 5)))
+            return max_positions, max_notional_per_trade
